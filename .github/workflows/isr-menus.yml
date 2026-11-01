@@ -1,0 +1,50 @@
+# Copies UIUC's ISR dining hall menus into isr.json on the "menus" branch, which Iron Ledger's Add food reads.
+# Kept in the Iron Ledger project as scripts/dining-workflow.yml (with the script it runs, scripts/isr-menu.ts)
+# and copied here by scripts/publish-dining.ts.
+name: ISR menus
+
+on:
+  schedule:
+    - cron: "17 9 * * *"    # early morning in Champaign
+    - cron: "17 16 * * *"   # late morning, in case a menu changed
+  workflow_dispatch:
+    inputs:
+      fresh:
+        description: Fetch every nutrition label again
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: isr-menus
+
+jobs:
+  menus:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TZ: America/Chicago   # "today" is Champaign's
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Get the last menus (past days and labels are kept from them)
+        run: |
+          if git fetch --depth=1 origin menus; then git show FETCH_HEAD:isr.json > last.json; fi
+      - name: Fetch the menus
+        env:
+          FRESH: ${{ inputs.fresh }}
+        run: |
+          if [ "$FRESH" = "true" ]; then node dining/isr-menu.ts last.json isr.json --fresh; else node dining/isr-menu.ts last.json isr.json; fi
+      - name: Publish them if they changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ -f last.json ]; then git worktree add -B menus out FETCH_HEAD; else git worktree add --orphan -b menus out; fi
+          cp isr.json out/isr.json
+          cd out
+          git add isr.json
+          if git diff --cached --quiet; then echo "No change."; else git commit -q -m "ISR menus, $(date +%F)" && git push origin menus; fi
