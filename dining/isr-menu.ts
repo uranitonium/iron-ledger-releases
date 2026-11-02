@@ -1,9 +1,10 @@
 // Copies UIUC's ISR dining hall menus into one file the app reads (src/dining.ts): each station's menu at
-// breakfast, lunch and dinner for the last week and the next day, with calories, protein, carbs and fat from each
-// food's nutrition label on the dining service's EatSmart site.
+// breakfast, lunch and dinner for the last week and the next day (Build Your Own's salad bar, deli, cereal and
+// so on under every meal), with calories, protein, carbs and fat from each food's nutrition label on the dining
+// service's EatSmart site.
 // GitHub Actions runs it twice a day in the public releases repository, which publishes the file
 // (scripts/dining-workflow.yml, put there by scripts/publish-dining.ts). Past days are kept from the last file
-// instead of fetched again, and each label is fetched once (by name and serving), so a run makes about 80
+// instead of fetched again, and each label is fetched once (by name and serving), so a run makes about 100
 // requests to the site, one at a time.
 // Run with: node scripts/isr-menu.ts <the last file, or a missing path> <output file> [--fresh: fetch every label again]
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -36,17 +37,28 @@ const mealOf = (name: string): DiningMeal | null => {
   return n.includes("breakfast") || n.includes("brunch") ? "breakfast" : n.includes("lunch") ? "lunch" : n.includes("dinner") ? "dinner" : null;
 };
 
-// A station's menus: one per date and meal.
-export function parseMenuList(html: string): { date: string; meal: DiningMeal; oid: number }[] {
+// A station's menus, by date: a meal ("Lunch"), or something else ("Salad Bar", "Late Night") with meal null.
+export interface MenuLink { date: string; meal: DiningMeal | null; name: string; oid: number }
+export function parseMenuList(html: string): MenuLink[] {
   return [...html.matchAll(/<header[^>]*>([^<]+)<\/header>([\s\S]*?)<\/section>/g)].flatMap(day => {
     const date = parseDate(textOf(day[1]));
     if(!date) return [];
-    return [...day[2].matchAll(/menuListSelectMenu\((\d+)\);"?>([^<]+)</g)].flatMap(m => {
-      const meal = mealOf(textOf(m[2]));
-      return meal ? [{ date, meal, oid: Number(m[1]) }] : [];
+    return [...day[2].matchAll(/menuListSelectMenu\((\d+)\);"?>([^<]+)</g)].map(m => {
+      const name = textOf(m[2]);
+      return { date, meal: mealOf(name), name, oid: Number(m[1]) };
     });
   });
 }
+
+// The menus to copy and the meals each belongs to. A station with no meal menus that day (Build Your Own:
+// "Salad Bar", "Cereal", "Deli & Bagel Bar") serves them all day, so they go under every meal. Anything else
+// that isn't a meal ("Late Night" at a station that also has lunch and dinner) is left out.
+export function menusToCopy(links: MenuLink[]): { date: string; meals: DiningMeal[]; name: string; oid: number }[] {
+  const hasMeals = new Set(links.filter(l => l.meal).map(l => l.date));
+  return links.flatMap(l => l.meal ? [{ date: l.date, meals: [l.meal], name: l.name, oid: l.oid }]
+    : hasMeals.has(l.date) ? [] : [{ date: l.date, meals: [...ALL_DAY], name: l.name, oid: l.oid }]);
+}
+const ALL_DAY: DiningMeal[] = ["breakfast", "lunch", "dinner"];
 
 // A menu's foods, in its parts ("Entrees", "Starches"): each food's label number, name and serving.
 export interface MenuItem { oid: number; name: string; serving: string }
@@ -140,10 +152,11 @@ export async function fetchMenus(last: DiningMenu | null, today: string, fresh: 
   if(!stations.length) throw new Error("No stations found: the EatSmart site may have changed.");
   let labels = 0;
   for(const station of stations){
-    const menus = parseMenuList(panel(await request("/Unit/SelectUnitFromChildUnitsList", { unitOid: station.oid }), "menuPanel")).filter(m => wanted(m.date));
+    const menus = menusToCopy(parseMenuList(panel(await request("/Unit/SelectUnitFromChildUnitsList", { unitOid: station.oid }), "menuPanel")).filter(m => wanted(m.date)));
     for(const menu of menus){
       const groups: { name: string; foods: string[] }[] = [];
-      for(const g of parseItems(panel(await request("/Menu/SelectMenu", { menuOid: menu.oid }), "itemPanel"))){
+      const parts = parseItems(panel(await request("/Menu/SelectMenu", { menuOid: menu.oid }), "itemPanel"));
+      for(const g of parts){
         const keys: string[] = [];
         for(const item of g.items){
           const key = keyOf(item.name, item.serving);
@@ -155,17 +168,23 @@ export async function fetchMenus(last: DiningMenu | null, today: string, fresh: 
           }
           if(!keys.includes(key)) keys.push(key);
         }
-        if(keys.length) groups.push({ name: g.name, foods: keys });
+        if(keys.length) groups.push({ name: partName(menu, parts.length, g.name), foods: keys });
       }
-      if(groups.length){
-        days[menu.date] ??= {};
-        (days[menu.date][menu.meal] ??= []).push({ name: station.name, groups });
+      if(groups.length) for(const meal of menu.meals){
+        const list = ((days[menu.date] ??= {})[meal] ??= []);
+        const at = list.find(s => s.name === station.name);
+        if(at) at.groups.push(...groups); else list.push({ name: station.name, groups: [...groups] });
       }
     }
   }
   console.log(`isr-menu: ${stations.length} stations, ${labels} labels fetched.`);
   return numbered(days, known);
 }
+
+// A part of an all-day menu says which menu it's from: "Salad Bar · Proteins", or just "Cereal" when the menu
+// has one part. A meal's parts keep their own names ("Entrees").
+export const partName = (menu: { meals: DiningMeal[]; name: string }, parts: number, group: string) =>
+  menu.meals.length === 1 ? group : parts === 1 ? menu.name : `${menu.name} · ${group}`;
 
 // The file lists each food once, sorted, and the menus point into it. Sorted foods and dates keep the file the
 // same when nothing changed, so it's only published when something did.
